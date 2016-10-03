@@ -8,6 +8,7 @@ from democracy.enums import Commenting, InitialSectionType
 from democracy.models import Hearing, Section, SectionImage
 from democracy.utils.drf_enum_field import EnumField
 from democracy.views.base import AdminsSeeUnpublishedMixin, BaseImageSerializer
+from democracy.pagination import DefaultPagination
 from democracy.views.utils import filter_by_hearing_visible, PublicFilteredImageField
 
 
@@ -68,10 +69,6 @@ class RootSectionImageSerializer(SectionImageSerializer):
         fields = SectionImageSerializer.Meta.fields + ['section', 'hearing']
 
 
-class ImagePagination(LimitOffsetPagination):
-    default_limit = 50
-
-
 class ImageFilter(filters.FilterSet):
     hearing = django_filters.CharFilter(name='section__hearing__id')
     section_type = django_filters.CharFilter(name='section__type__identifier')
@@ -85,7 +82,7 @@ class ImageFilter(filters.FilterSet):
 class ImageViewSet(AdminsSeeUnpublishedMixin, viewsets.ReadOnlyModelViewSet):
     model = SectionImage
     serializer_class = RootSectionImageSerializer
-    pagination_class = ImagePagination
+    pagination_class = DefaultPagination
     filter_class = ImageFilter
 
     def get_queryset(self):
@@ -111,15 +108,11 @@ class SectionFilter(filters.FilterSet):
         fields = ['hearing', 'type']
 
 
-class SectionPagination(LimitOffsetPagination):
-    default_limit = 50
-
-
 # root level Section endpoint
 class RootSectionViewSet(AdminsSeeUnpublishedMixin, viewsets.ReadOnlyModelViewSet):
     serializer_class = RootSectionSerializer
     model = Section
-    pagination_class = SectionPagination
+    pagination_class = DefaultPagination
     filter_class = SectionFilter
 
     def get_queryset(self):
