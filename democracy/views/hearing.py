@@ -2,12 +2,10 @@ from collections import defaultdict
 import django_filters
 from django.db import transaction
 from django.db.models import Prefetch
-from django.utils.timezone import now
 from rest_framework import filters, permissions, response, serializers, status, viewsets
 from rest_framework.decorators import detail_route, list_route
 from rest_framework.fields import JSONField
-from rest_framework.exceptions import NotFound, ValidationError
-from rest_framework.response import Response
+from rest_framework.exceptions import NotFound, ValidationError, PermissionDenied
 
 from democracy.enums import InitialSectionType
 from democracy.models import ContactPerson, Hearing, Label, Section, SectionImage
@@ -19,7 +17,7 @@ from democracy.views.section import (SectionCreateUpdateSerializer, SectionField
                                      SectionSerializer)
 
 from .hearing_report import HearingReport
-from .utils import NestedPKRelatedField
+from .utils import NestedPKRelatedField, filter_by_hearing_visible
 
 
 class HearingFilter(django_filters.FilterSet):
@@ -42,25 +40,77 @@ class HearingCreateUpdateSerializer(serializers.ModelSerializer):
                                            serializer=ContactPersonSerializer)
     labels = NestedPKRelatedField(queryset=Label.objects.all(), many=True, expanded=True, serializer=LabelSerializer)
 
+    organization = serializers.SlugRelatedField(
+        read_only=True,
+        slug_field='name'
+    )
+
     class Meta:
         model = Hearing
         fields = [
-            'title', 'id', 'borough',
-            'published', 'open_at', 'close_at',
+            'title', 'id', 'borough', 'force_closed',
+            'published', 'open_at', 'close_at', 'created_at',
             'servicemap_url', 'sections',
             'closed', 'geojson', 'organization', 'slug',
             'contact_persons', 'labels',
         ]
 
+    def __init__(self, *args, **kwargs):
+        super(HearingCreateUpdateSerializer, self).__init__(*args, **kwargs)
+        self.partial = kwargs.get('partial', False)
+
+    def _create_or_update_sections(self, hearing, sections_data, force_create=False):
+        """
+        Create or update sections of a hearing
+
+        :param hearing: The hearing
+        :type hearing: democracy.models.Hearing
+
+        :param sections_data: The list of serialized sections to create or update
+        :type sections_data: list of dictionaries
+
+        :param force_create: Boolean to force the creation of new sections despite
+                             the presences of section ID.
+        :type force_create: Boolean
+
+        :return: The set of the newly created/updated sections
+        :rtype: Set of democracy.models.Section
+        """
+        sections = set()
+        for index, section_data in enumerate(sections_data):
+            section_data['ordering'] = index
+            pk = section_data.pop('id', None)
+
+            serializer_params = {
+                'data': section_data,
+            }
+
+            if pk and not force_create:
+                try:
+                    section = hearing.sections.get(id=pk)
+                    serializer_params['instance'] = section
+                except Section.DoesNotExist:
+                    pass
+
+            serializer = SectionCreateUpdateSerializer(**serializer_params)
+
+            try:
+                serializer.is_valid(raise_exception=True)
+            except ValidationError as e:
+                errors = [{} for _ in range(len(sections_data))]
+                errors[index] = e.detail
+                raise ValidationError({'sections': errors})
+
+            section = serializer.save(hearing=hearing)
+            sections.add(section)
+        return sections
+
     @transaction.atomic()
     def create(self, validated_data):
         sections_data = validated_data.pop('sections')
+        validated_data['organization'] = self.context['request'].user.get_default_organization()
         hearing = super().create(validated_data)
-
-        for section_data in sections_data:
-            section_data.pop('id', None)
-            Section.objects.create(hearing=hearing, **section_data)
-
+        self._create_or_update_sections(hearing, sections_data, force_create=True)
         return hearing
 
     @transaction.atomic()
@@ -73,34 +123,16 @@ class HearingCreateUpdateSerializer(serializers.ModelSerializer):
           * If a section with given id exists, update it.
           * Old sections whose ids aren't matched are (soft) deleted.
         """
+        if instance.organization != self.context['request'].user.get_default_organization():
+            raise PermissionDenied('User cannot update hearings from different organizations.')
+
+        if self.partial:
+            return super().update(instance, validated_data)
+
         sections_data = validated_data.pop('sections')
-        new_section_ids = set()
         hearing = super().update(instance, validated_data)
-
-        for index, section_data in enumerate(sections_data):
-            section_data['ordering'] = index
-            pk = section_data.pop('id', None)
-
-            try:
-                section = hearing.sections.get(id=pk) if pk else None
-            except Section.DoesNotExist:
-                section = None
-
-            if section:
-                serializer = SectionCreateUpdateSerializer(instance=section, data=section_data)
-            else:
-                serializer = SectionCreateUpdateSerializer(data=section_data)
-
-            try:
-                serializer.is_valid(raise_exception=True)
-            except ValidationError as e:
-                errors = [{} for _ in range(len(sections_data))]
-                errors[index] = e.detail
-                raise ValidationError({'sections': errors})
-
-            section = serializer.save(hearing=hearing)
-            new_section_ids.add(section.id)
-
+        sections = self._create_or_update_sections(hearing, sections_data)
+        new_section_ids = set([section.id for section in sections])
         for section in hearing.sections.exclude(id__in=new_section_ids):
             for image in section.images.all():
                 image.soft_delete()
@@ -109,6 +141,9 @@ class HearingCreateUpdateSerializer(serializers.ModelSerializer):
         return hearing
 
     def validate_sections(self, data):
+        if self.partial:
+            raise ValidationError('Sections cannot be updated by PATCHing the Hearing')
+
         num_of_sections = defaultdict(int)
 
         for section_data in data:
@@ -248,18 +283,14 @@ class HearingViewSet(AdminsSeeUnpublishedMixin, viewsets.ModelViewSet):
         return queryset.order_by('-created_at')
 
     def get_queryset(self):
-        queryset = super(HearingViewSet, self).get_queryset().prefetch_related(
+        queryset = filter_by_hearing_visible(Hearing.objects.with_unpublished(), self.request,
+                                             hearing_lookup='').prefetch_related(
             Prefetch(
                 'sections',
                 queryset=Section.objects.filter(type__identifier='main'),
                 to_attr='main_section_list'
             )
         )
-
-        # unless the user is a superuser, only show open hearings in the hearing list
-        if not self.request.user.is_superuser:
-            queryset = queryset.filter(open_at__lte=now())
-
         return self.common_queryset_filtering(queryset)
 
     def get_object(self):
@@ -279,15 +310,16 @@ class HearingViewSet(AdminsSeeUnpublishedMixin, viewsets.ModelViewSet):
         except Hearing.DoesNotExist:
             raise NotFound()
 
-        is_superuser = self.request.user.is_superuser
+        user = self.request.user
+
         preview_code = None
-        if not obj.published and not is_superuser:
+        if not obj.is_visible_for(user):
             preview_code = self.request.query_params.get('preview')
             if not preview_code or preview_code != obj.preview_code:
                 raise NotFound()
 
         # require preview_code or superuser status to show a not yet opened hearing
-        if not (preview_code or is_superuser or obj.open_at <= now()):
+        if not (preview_code or obj.is_visible_for(user)):
             raise NotFound()
 
         self.check_object_permissions(self.request, obj)
@@ -332,4 +364,16 @@ class HearingViewSet(AdminsSeeUnpublishedMixin, viewsets.ModelViewSet):
             return self.get_paginated_response(serializer.data)
 
         serializer = HearingMapSerializer(queryset, many=True)
-        return Response(serializer.data)
+        return response.Response(serializer.data)
+
+    def create(self, request):
+        if not request.user or not request.user.get_default_organization():
+            return response.Response({'status': 'User without organization cannot POST hearings.'},
+                                     status=status.HTTP_403_FORBIDDEN)
+        return super().create(request)
+
+    def update(self, request, pk=None, partial=False):
+        if not request.user or not request.user.get_default_organization():
+            return response.Response({'status': 'User without organization cannot PUT hearings.'},
+                                     status=status.HTTP_403_FORBIDDEN)
+        return super().update(request, pk=pk, partial=partial)
