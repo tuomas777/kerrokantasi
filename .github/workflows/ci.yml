@@ -1,0 +1,16 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  common:
+    uses: tuomas777/.github/.github/workflows/ci-django-api.yml@reusable_workflow_precommit
+    secrets: inherit
+    with:
+      python-version: 3.9
+      postgres-major-version: 14
+      use-postgis: true
